@@ -1,0 +1,19 @@
+#!/bin/sh
+
+# TODO: Use vendoring. However, for now, too many of our direct dependencies
+# don't vendor, and we would need to vendor indirect dependencies, which is too
+# much work to us to maintain.
+
+set -e
+
+die() {
+    echo "$(basename $0): *** $*" >&2
+    exit 1
+}
+
+test -n "$GOPATH" || die "GOPATH is not set"
+
+go get github.com/boltdb/bolt
+go get github.com/BurntSushi/toml
+go get github.com/mmcdole/gofeed
+go get gopkg.in/alecthomas/kingpin.v2
