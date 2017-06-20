@@ -1,0 +1,23 @@
+[package]
+name = "rss2email"
+version = "0.1.0"
+authors = ["Craig M. Brandenburg <c.m.brandenburg@gmail.com>"]
+
+[dependencies]
+atom_syndication = "0.4.1"
+byteorder = "1.0.0"
+clap = "2.25.0"
+escapade = "0.0.3"
+futures = "0.1.14"
+lettre = "0.6.2"
+lmdb = "0.6.0"
+lmdb-sys = "0.6.0"
+reqwest = "0.6.2"
+rmp-serde = "0.13.3"
+rss = "0.6.0"
+serde = "1.0.8"
+serde_derive = "1.0.8"
+toml = "0.4.2"
+
+[dev-dependencies]
+tempdir = "0.3.5"
