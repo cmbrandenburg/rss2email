@@ -39,7 +39,10 @@ impl Model {
 
         match std::fs::metadata(path) {
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err((format!("Failed to obtain file metadata (path: {:?})", path), e))?,
+            Err(e) => return Err((
+                format!("Failed to obtain file metadata (path: {:?})", path),
+                e,
+            ))?,
             Ok(..) => return Err(format!("Database already exists (path: {:?})", path))?,
         }
 
@@ -51,9 +54,14 @@ impl Model {
         let path = path.as_ref();
 
         match std::fs::metadata(path) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!("Database does not exist (path: {:?})",
-                                                                                         path))?,
-            Err(e) => return Err((format!("Failed to obtain file metadata (path: {:?})", path), e))?,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!(
+                "Database does not exist (path: {:?})",
+                path
+            ))?,
+            Err(e) => return Err((
+                format!("Failed to obtain file metadata (path: {:?})", path),
+                e,
+            ))?,
             Ok(..) => {}
         }
 
@@ -66,89 +74,117 @@ impl Model {
             .set_flags(lmdb::NO_SUB_DIR)
             .set_max_dbs(2)
             .open(path)
-            .map_err(|e| (format!("Failed to open LMDB environment (path: {:?})", path), e))?;
+            .map_err(|e| {
+                (
+                    format!("Failed to open LMDB environment (path: {:?})", path),
+                    e,
+                )
+            })?;
 
         let open_db = |environment: &lmdb::Environment, db_name: &str| -> Result<lmdb::Database, Error> {
             let flags = lmdb::DatabaseFlags::empty();
-            environment
-                .create_db(Some(db_name), flags)
-                .map_err(|e| {
-                    Error::from((format!("Failed to open LMDB database (path: {:?}, database: {:?}, flags = 0x{:x})",
-                                         path,
-                                         db_name,
-                                         flags.bits()),
-                                 e))
-                })
+            environment.create_db(Some(db_name), flags).map_err(|e| {
+                Error::from((
+                    format!(
+                        "Failed to open LMDB database (path: {:?}, database: {:?}, flags = 0x{:x})",
+                        path,
+                        db_name,
+                        flags.bits()
+                    ),
+                    e,
+                ))
+            })
         };
 
         Ok(Model {
-               path: PathBuf::from(path),
-               db_feed: open_db(&environment, DB_FEED)?,
-               db_item: open_db(&environment, DB_ITEM)?,
-               environment: FakeDebug(environment),
-           })
+            path: PathBuf::from(path),
+            db_feed: open_db(&environment, DB_FEED)?,
+            db_item: open_db(&environment, DB_ITEM)?,
+            environment: FakeDebug(environment),
+        })
     }
 
     fn begin_rw_transaction(&self) -> Result<lmdb::RwTransaction, Error> {
-        self.environment
-            .begin_rw_txn()
-            .map_err(|e| {
-                         Error::from((format!("Failed to begin LMDB read-write transaction (path: {:?})",
-                                              self.path),
-                                      e))
-                     })
+        self.environment.begin_rw_txn().map_err(|e| {
+            Error::from((
+                format!(
+                    "Failed to begin LMDB read-write transaction (path: {:?})",
+                    self.path
+                ),
+                e,
+            ))
+        })
     }
 
     fn begin_ro_transaction(&self) -> Result<lmdb::RoTransaction, Error> {
-        self.environment
-            .begin_ro_txn()
-            .map_err(|e| {
-                         Error::from((format!("Failed to begin LMDB read-only transaction (path: {:?})",
-                                              self.path),
-                                      e))
-                     })
+        self.environment.begin_ro_txn().map_err(|e| {
+            Error::from((
+                format!(
+                    "Failed to begin LMDB read-only transaction (path: {:?})",
+                    self.path
+                ),
+                e,
+            ))
+        })
     }
 
     fn commit_transaction(&self, tx: lmdb::RwTransaction) -> Result<(), Error> {
-        tx.commit()
-            .map_err(|e| {
-                         Error::from((format!("Failed to commit database transaction (path: {:?})",
-                                              self.path),
-                                      e))
-                     })
+        tx.commit().map_err(|e| {
+            Error::from((
+                format!(
+                    "Failed to commit database transaction (path: {:?})",
+                    self.path
+                ),
+                e,
+            ))
+        })
     }
 
     fn delete_all_items_for_feed(&self, tx: &mut lmdb::RwTransaction, feed_url: &str) -> Result<(), Error> {
 
-        let mut cursor = tx.open_rw_cursor(self.db_item)
-            .map_err(|e| (format!("Failed to obtain read-write cursor to {:?} table", DB_ITEM), e))?;
+        let mut cursor = tx.open_rw_cursor(self.db_item).map_err(|e| {
+            (
+                format!("Failed to obtain read-write cursor to {:?} table", DB_ITEM),
+                e,
+            )
+        })?;
 
         let search_bytes = &DbItemSearch {
-                feed_url: feed_url,
-                item_id: None,
-            }
-            .to_bytes();
+            feed_url: feed_url,
+            item_id: None,
+        }.to_bytes();
 
         let mut key_bytes = match cursor.get(Some(&search_bytes), None, lmdb_sys::MDB_SET_RANGE) {
             Err(lmdb::Error::NotFound) => return Ok(()), // nothing to do
-            Err(e) => Err((format!("Failed to position cursor to first feed item in {:?} table",
-                                   DB_ITEM),
-                           e))?,
+            Err(e) => Err((
+                format!(
+                    "Failed to position cursor to first feed item in {:?} table",
+                    DB_ITEM
+                ),
+                e,
+            ))?,
             Ok((None, _)) => unreachable!(),
             Ok((Some(x), _)) => x,
         };
 
         while key_bytes.starts_with(search_bytes) {
-            cursor
-                .del(lmdb::WriteFlags::empty())
-                .map_err(|e| (format!("Failed to decode feed item from {:?} table", DB_ITEM), e))?;
+            cursor.del(lmdb::WriteFlags::empty()).map_err(|e| {
+                (
+                    format!("Failed to decode feed item from {:?} table", DB_ITEM),
+                    e,
+                )
+            })?;
 
             key_bytes = match cursor.get(None, None, lmdb_sys::MDB_NEXT) {
                 Ok(x) => x.0.unwrap(),
                 Err(lmdb::Error::NotFound) => break,
-                Err(e) => Err((format!("Failed to advance cursor position within {:?} table",
-                                       DB_ITEM),
-                               e))?,
+                Err(e) => Err((
+                    format!(
+                        "Failed to advance cursor position within {:?} table",
+                        DB_ITEM
+                    ),
+                    e,
+                ))?,
             };
         }
 
@@ -156,14 +192,18 @@ impl Model {
     }
 
     pub fn for_each_feed<F>(&self, mut callback: F) -> Result<(), Error>
-        where F: FnMut(&str) -> Result<(), Error>
+    where
+        F: FnMut(&str) -> Result<(), Error>,
     {
         let tx = self.begin_ro_transaction()?;
 
         for (key_bytes, _value_bytes) in
             tx.open_ro_cursor(self.db_feed)
-                .map_err(|e| (format!("Failed to obtain cursor to {:?} table", DB_FEED), e))?
-                .iter() {
+                .map_err(|e| {
+                    (format!("Failed to obtain cursor to {:?} table", DB_FEED), e)
+                })?
+                .iter()
+        {
             let key = DbFeedKey::from_bytes(key_bytes)?;
             callback(key.feed_url)?;
         }
@@ -180,10 +220,14 @@ impl Model {
 
         match tx.get(self.db_feed, &key_bytes) {
             Err(lmdb::Error::NotFound) => {}
-            Err(e) => return Err((format!("Failed to look up feed in {:?} table (feed URL: {:?})",
-                                          DB_FEED,
-                                          feed_url),
-                                  e))?,
+            Err(e) => return Err((
+                format!(
+                    "Failed to look up feed in {:?} table (feed URL: {:?})",
+                    DB_FEED,
+                    feed_url
+                ),
+                e,
+            ))?,
             Ok(..) => return Err((format!("Feed already exists (feed URL: {:?})", feed_url)))?,
         }
 
@@ -198,16 +242,21 @@ impl Model {
         let value = DbFeedValue { when_added: now };
         let value_bytes = value.to_bytes();
 
-        tx.put(self.db_feed,
-                 &key_bytes,
-                 &value_bytes,
-                 lmdb::WriteFlags::empty())
-            .map_err(|e| {
-                         (format!("Failed to add feed to {:?} table (feed URL: {:?})",
-                                  DB_FEED,
-                                  feed_url),
-                          e)
-                     })?;
+        tx.put(
+            self.db_feed,
+            &key_bytes,
+            &value_bytes,
+            lmdb::WriteFlags::empty(),
+        ).map_err(|e| {
+                (
+                    format!(
+                        "Failed to add feed to {:?} table (feed URL: {:?})",
+                        DB_FEED,
+                        feed_url
+                    ),
+                    e,
+                )
+            })?;
 
         self.commit_transaction(tx)
     }
@@ -221,10 +270,14 @@ impl Model {
 
         match tx.del(self.db_feed, &key_bytes, None) {
             Err(lmdb::Error::NotFound) => return Err(format!("Feed does not exist (feed URL: {:?})", feed_url))?,
-            Err(e) => return Err((format!("Failed to delete feed from {:?} table (feed URL: {:?})",
-                                          DB_FEED,
-                                          feed_url),
-                                  e))?,
+            Err(e) => return Err((
+                format!(
+                    "Failed to delete feed from {:?} table (feed URL: {:?})",
+                    DB_FEED,
+                    feed_url
+                ),
+                e,
+            ))?,
             Ok(..) => {}
         }
 
@@ -232,14 +285,16 @@ impl Model {
         self.commit_transaction(tx)
     }
 
-    pub fn fetch_and_send_feeds<F, S>(&self,
-                                      logger: Arc<Logger>,
-                                      fetcher: F,
-                                      sender: &S,
-                                      options: &FetchAndSendOptions)
-                                      -> Result<(), Error>
-        where F: Fetcher,
-              S: Sender
+    pub fn fetch_and_send_feeds<F, S>(
+        &self,
+        logger: Arc<Logger>,
+        fetcher: F,
+        sender: &S,
+        options: &FetchAndSendOptions,
+    ) -> Result<(), Error>
+    where
+        F: Fetcher,
+        S: Sender,
     {
         // Even though this is a long-running operation, we do it within a
         // single transaction so that there are no race conditions with other
@@ -256,11 +311,13 @@ impl Model {
             // simultaneously modifying the database.
 
             let feeds_to_fetch = tx.open_ro_cursor(self.db_feed)
-                .map_err(|e| (format!("Failed to obtain cursor to {:?} table", DB_FEED), e))?
+                .map_err(|e| {
+                    (format!("Failed to obtain cursor to {:?} table", DB_FEED), e)
+                })?
                 .iter()
                 .map(|(key_bytes, _value_bytes)| -> Result<String, Error> {
-                         Ok(String::from(DbFeedKey::from_bytes(key_bytes)?.feed_url))
-                     })
+                    Ok(String::from(DbFeedKey::from_bytes(key_bytes)?.feed_url))
+                })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .filter(|feed_url| options.should_fetch(feed_url))
@@ -294,10 +351,9 @@ impl Model {
                 for item in &feed.items {
 
                     let item_key_bytes = DbItemKey {
-                            feed_url: &feed.meta.feed_url,
-                            item_id: &item.id,
-                        }
-                        .to_bytes();
+                        feed_url: &feed.meta.feed_url,
+                        item_id: &item.id,
+                    }.to_bytes();
 
                     let item_value = match tx.get(self.db_item, &item_key_bytes) {
                         Ok(item_value_bytes) => {
@@ -306,15 +362,27 @@ impl Model {
                             Some(item_value)
                         }
                         Err(lmdb::Error::NotFound) => None,
-                        Err(e) => Err((format!("Failed to look up feed item in {:?} table", DB_ITEM), e))?,
+                        Err(e) => Err((
+                            format!(
+                                "Failed to look up feed item in {:?} table",
+                                DB_ITEM
+                            ),
+                            e,
+                        ))?,
                     };
 
                     if let Some(item_value) = item_value {
-                        tx.put(self.db_item,
-                                 &item_key_bytes,
-                                 &item_value.to_bytes(),
-                                 lmdb::WriteFlags::empty())
-                            .map_err(|e| (format!("Failed to update feed item in {:?} table", DB_ITEM), e))?;
+                        tx.put(
+                            self.db_item,
+                            &item_key_bytes,
+                            &item_value.to_bytes(),
+                            lmdb::WriteFlags::empty(),
+                        ).map_err(|e| {
+                                (
+                                    format!("Failed to update feed item in {:?} table", DB_ITEM),
+                                    e,
+                                )
+                            })?;
                         continue;
                     }
 
@@ -322,31 +390,39 @@ impl Model {
 
                     match sender.send(&logger, &feed.meta, &item) {
                         Err(e) => {
-                            logger.log(LogLevel::Important,
-                                       LogKind::Error,
-                                       format!("An error occurred while sending (feed id = {}): {}",
-                                               item.id,
-                                               e));
+                            logger.log(
+                                LogLevel::Important,
+                                LogKind::Error,
+                                format!(
+                                    "An error occurred while sending (feed id = {}): {}",
+                                    item.id,
+                                    e
+                                ),
+                            );
                             break;
                         }
                         Ok(..) => {
 
                             let item_value_bytes = DbItemValue {
-                                    when_first_fetched: now,
-                                    when_last_fetched: now,
-                                }
-                                .to_bytes();
+                                when_first_fetched: now,
+                                when_last_fetched: now,
+                            }.to_bytes();
 
-                            tx.put(self.db_item,
-                                     &item_key_bytes,
-                                     &item_value_bytes,
-                                     lmdb::WriteFlags::empty())
-                                .map_err(|e| {
-                                    (format!("Failed to add feed item to {:?} table (feed URL: {:?}, feed item = {:?})",
-                                             DB_ITEM,
-                                             feed.meta.feed_url,
-                                             item),
-                                     e)
+                            tx.put(
+                                self.db_item,
+                                &item_key_bytes,
+                                &item_value_bytes,
+                                lmdb::WriteFlags::empty(),
+                            ).map_err(|e| {
+                                    (
+                                        format!(
+                                            "Failed to add feed item to {:?} table (feed URL: {:?}, feed item = {:?})",
+                                            DB_ITEM,
+                                            feed.meta.feed_url,
+                                            item
+                                        ),
+                                        e,
+                                    )
                                 })?;
                         }
                     }
@@ -365,12 +441,15 @@ struct DbFeedKey<'a> {
 
 impl<'a> DbFeedKey<'a> {
     fn from_bytes(source: &'a [u8]) -> Result<Self, Error> {
-        let feed_url = std::str::from_utf8(source)
-            .map_err(|e| {
-                         (format!("Failed to decode feed key from database (source: {:?})",
-                                  source),
-                          e)
-                     })?;
+        let feed_url = std::str::from_utf8(source).map_err(|e| {
+            (
+                format!(
+                    "Failed to decode feed key from database (source: {:?})",
+                    source
+                ),
+                e,
+            )
+        })?;
         Ok(DbFeedKey { feed_url: feed_url })
     }
 
@@ -437,10 +516,9 @@ impl<'a> DbItemKey<'a> {
 
     fn to_bytes(&self) -> Vec<u8> {
         DbItemSearch {
-                feed_url: self.feed_url,
-                item_id: Some(self.item_id),
-            }
-            .to_bytes()
+            feed_url: self.feed_url,
+            item_id: Some(self.item_id),
+        }.to_bytes()
     }
 }
 
@@ -470,26 +548,30 @@ struct DbItemValueSerial {
 
 impl DbItemValue {
     fn from_bytes(source: &[u8]) -> Result<Self, Error> {
-        let x = rmp_serde::from_slice::<DbItemValueSerial>(source)
-            .map_err(|e| {
-                         Error::from((format!("Failed to decode feed item from database (source: {:?})",
-                                              source),
-                                      e))
-                     })?;
+        let x = rmp_serde::from_slice::<DbItemValueSerial>(source).map_err(
+            |e| {
+                Error::from((
+                    format!(
+                        "Failed to decode feed item from database (source: {:?})",
+                        source
+                    ),
+                    e,
+                ))
+            },
+        )?;
         Ok(DbItemValue {
-               when_first_fetched: system_time_from_parts(x.when_first_fetched.0, x.when_first_fetched.1),
-               when_last_fetched: system_time_from_parts(x.when_last_fetched.0, x.when_last_fetched.1),
-           })
+            when_first_fetched: system_time_from_parts(x.when_first_fetched.0, x.when_first_fetched.1),
+            when_last_fetched: system_time_from_parts(x.when_last_fetched.0, x.when_last_fetched.1),
+        })
     }
 
     fn to_bytes(&self) -> Vec<u8> {
         let t1 = system_time_to_parts(self.when_first_fetched);
         let t2 = system_time_to_parts(self.when_last_fetched);
         rmp_serde::to_vec(&DbItemValueSerial {
-                              when_first_fetched: (t1.0, t1.1),
-                              when_last_fetched: (t2.0, t2.1),
-                          })
-                .unwrap()
+            when_first_fetched: (t1.0, t1.1),
+            when_last_fetched: (t2.0, t2.1),
+        }).unwrap()
     }
 }
 
@@ -552,45 +634,56 @@ mod tests {
         db.add_feed("http://example.com").unwrap();
         let logger = Arc::new(Logger::new(LogLevel::Nothing));
 
-        let fetcher =
-            MockFetcher::from(vec![Ok(Feed {
-                                          meta: FeedMeta {
-                                              feed_url: String::from("http://example.com"),
-                                              title: String::from("Example"),
-                                          },
-                                          items: vec![FeedItem {
-                                                          id: String::from("id alpha"),
-                                                          title: Some(String::from("entry alpha")),
-                                                          link: Some(String::from("http://example.com/alpha")),
-                                                          content: Some(String::from("blah blah blah")),
-                                                      }],
-                                      })]);
+        let fetcher = MockFetcher::from(vec![
+            Ok(Feed {
+                meta: FeedMeta {
+                    feed_url: String::from("http://example.com"),
+                    title: String::from("Example"),
+                },
+                items: vec![
+                    FeedItem {
+                        id: String::from("id alpha"),
+                        title: Some(String::from("entry alpha")),
+                        link: Some(String::from("http://example.com/alpha")),
+                        content: Some(String::from("blah blah blah")),
+                    },
+                ],
+            }),
+        ]);
 
         let sender = RecorderSender::new();
-        db.fetch_and_send_feeds(logger.clone(),
-                                  fetcher.clone(),
-                                  &sender,
-                                  &FetchAndSendOptions::default())
-            .unwrap();
+        db.fetch_and_send_feeds(
+            logger.clone(),
+            fetcher.clone(),
+            &sender,
+            &FetchAndSendOptions::default(),
+        ).unwrap();
         let got_items = sender.recorded_items();
-        assert_eq!(got_items,
-                   &[(FeedMeta {
-                         feed_url: String::from("http://example.com"),
-                         title: String::from("Example"),
-                     },
-                     FeedItem {
-                         id: String::from("id alpha"),
-                         title: Some(String::from("entry alpha")),
-                         link: Some(String::from("http://example.com/alpha")),
-                         content: Some(String::from("blah blah blah")),
-                     })]);
+        assert_eq!(
+            got_items,
+            &[
+                (
+                    FeedMeta {
+                        feed_url: String::from("http://example.com"),
+                        title: String::from("Example"),
+                    },
+                    FeedItem {
+                        id: String::from("id alpha"),
+                        title: Some(String::from("entry alpha")),
+                        link: Some(String::from("http://example.com/alpha")),
+                        content: Some(String::from("blah blah blah")),
+                    },
+                ),
+            ]
+        );
 
         let sender = RecorderSender::new();
-        db.fetch_and_send_feeds(logger.clone(),
-                                  fetcher.clone(),
-                                  &sender,
-                                  &FetchAndSendOptions::default())
-            .unwrap();
+        db.fetch_and_send_feeds(
+            logger.clone(),
+            fetcher.clone(),
+            &sender,
+            &FetchAndSendOptions::default(),
+        ).unwrap();
         let got_items = sender.recorded_items();
         assert_eq!(got_items, &[]);
     }

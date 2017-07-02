@@ -43,9 +43,8 @@ impl Logger {
         let actual = format!("{}{}\n", prefix, message.to_string());
 
         let stderr = std::io::stderr();
-        stderr
-            .lock()
-            .write_all(actual.as_bytes())
-            .expect("Failed to print log message");
+        stderr.lock().write_all(actual.as_bytes()).expect(
+            "Failed to print log message",
+        );
     }
 }

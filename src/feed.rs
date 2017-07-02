@@ -53,10 +53,10 @@ impl RecorderSender {
 #[cfg(test)]
 impl Sender for RecorderSender {
     fn send(&self, _logger: &Logger, feed_meta: &FeedMeta, feed_item: &FeedItem) -> Result<(), Error> {
-        self.recorded_items
-            .lock()
-            .unwrap()
-            .push((feed_meta.clone(), feed_item.clone()));
+        self.recorded_items.lock().unwrap().push((
+            feed_meta.clone(),
+            feed_item.clone(),
+        ));
         Ok(())
     }
 }
@@ -78,10 +78,10 @@ impl EmailSender {
             .build();
 
         Ok(EmailSender {
-               config: config.clone(),
-               mail_client: FakeDebug(Mutex::new(mail_client)),
-               no_send: false,
-           })
+            config: config.clone(),
+            mail_client: FakeDebug(Mutex::new(mail_client)),
+            no_send: false,
+        })
     }
 
     pub fn with_no_send(mut self, no_send: bool) -> Self {
@@ -95,11 +95,9 @@ impl Sender for EmailSender {
 
         use lettre::transport::EmailTransport;
 
-        let item_title = feed_item
-            .title
-            .as_ref()
-            .map(|x| x.as_str())
-            .unwrap_or("(N/a)");
+        let item_title = feed_item.title.as_ref().map(|x| x.as_str()).unwrap_or(
+            "(N/a)",
+        );
 
         if feed_item.content.is_none() {
             panic!("Got no content for {}", feed_meta.feed_url);
@@ -108,20 +106,27 @@ impl Sender for EmailSender {
         let item_content = feed_item.content.as_ref().map(|x| x.as_str()).unwrap_or("");
 
         let body = match feed_item.link {
-            None => format!(r#"<h1>{}</h1>{}"#,
-                            item_title.escape().into_inner(),
-                            item_content),
-            Some(ref link) => format!(r#"<h1><a href="{}">{}</a></h1>{}<p><a href="{}">{}</a></p>"#,
-                                      link.escape().into_inner(),
-                                      item_title.escape().into_inner(),
-                                      item_content,
-                                      link.escape().into_inner(),
-                                      link.escape().into_inner()),
+            None => format!(
+                r#"<h1>{}</h1>{}"#,
+                item_title.escape().into_inner(),
+                item_content
+            ),
+            Some(ref link) => format!(
+                r#"<h1><a href="{}">{}</a></h1>{}<p><a href="{}">{}</a></p>"#,
+                link.escape().into_inner(),
+                item_title.escape().into_inner(),
+                item_content,
+                link.escape().into_inner(),
+                link.escape().into_inner()
+            ),
         };
 
         let email = lettre::email::EmailBuilder::new()
             .to(self.config.recipient.as_ref())
-            .from((self.config.smtp_username.as_ref(), feed_meta.title.as_ref()))
+            .from((
+                self.config.smtp_username.as_ref(),
+                feed_meta.title.as_ref(),
+            ))
             .subject(&item_title)
             .header(("Content-Type", "text/html"))
             .body(&body)
@@ -136,24 +141,28 @@ impl Sender for EmailSender {
 
         if !self.no_send {
 
-            logger.log(LogLevel::Verbose,
-                       LogKind::Info,
-                       format!("Sending {} — {:?}", feed_meta.feed_url, item_title));
+            logger.log(
+                LogLevel::Verbose,
+                LogKind::Info,
+                format!("Sending {} — {:?}", feed_meta.feed_url, item_title),
+            );
 
-            self.mail_client
-                .lock()
-                .unwrap()
-                .send(email)
-                .map_err(|e| {
-                             (format!("Failed to send email (feed url: {}, feed item id: {})",
-                                      feed_meta.feed_url,
-                                      feed_item.id),
-                              e)
-                         })?;
+            self.mail_client.lock().unwrap().send(email).map_err(|e| {
+                (
+                    format!(
+                        "Failed to send email (feed url: {}, feed item id: {})",
+                        feed_meta.feed_url,
+                        feed_item.id
+                    ),
+                    e,
+                )
+            })?;
         } else {
-            logger.log(LogLevel::Verbose,
-                       LogKind::Info,
-                       format!("Not sending {} — {:?}", feed_meta.feed_url, item_title));
+            logger.log(
+                LogLevel::Verbose,
+                LogKind::Info,
+                format!("Not sending {} — {:?}", feed_meta.feed_url, item_title),
+            );
         }
 
         Ok(())
@@ -173,8 +182,9 @@ pub struct NetFetcher {
 impl NetFetcher {
     pub fn new() -> Result<Self, Error> {
 
-        let mut client = reqwest::Client::new()
-            .map_err(|e| ("Failed to construct HTTP client", e))?;
+        let mut client = reqwest::Client::new().map_err(|e| {
+            ("Failed to construct HTTP client", e)
+        })?;
 
         client.timeout(std::time::Duration::new(FETCH_TIMEOUT_SECS, 0));
 
@@ -183,31 +193,35 @@ impl NetFetcher {
 
     // It's kinda poor to wrap a channel in an Arc<Mutex<>>, but we need the
     // Sync and Send traits.
-    fn fetch_thread(logger: Arc<Logger>,
-                    client: Arc<Mutex<reqwest::Client>>,
-                    feed_urls: Arc<Mutex<Vec<String>>>,
-                    send_chan: Arc<Mutex<futures::sink::Wait<futures::sync::mpsc::Sender<Result<Feed, String>>>>>) {
+    fn fetch_thread(
+        logger: Arc<Logger>,
+        client: Arc<Mutex<reqwest::Client>>,
+        feed_urls: Arc<Mutex<Vec<String>>>,
+        send_chan: Arc<Mutex<futures::sink::Wait<futures::sync::mpsc::Sender<Result<Feed, String>>>>>,
+    ) {
 
         let fetch_it = |feed_url: &str| -> Result<String, Error> {
 
             use std::io::Read;
 
-            logger.log(LogLevel::Normal,
-                       LogKind::Info,
-                       format!("Fetching {}", feed_url));
+            logger.log(
+                LogLevel::Normal,
+                LogKind::Info,
+                format!("Fetching {}", feed_url),
+            );
 
             let request = {
                 client.lock().unwrap().get(feed_url)
             };
 
-            let mut response = request
-                .send()
-                .map_err(|e| (format!("Failed to fetch feed (feed URL: {}): {}", feed_url, e)))?;
+            let mut response = request.send().map_err(|e| {
+                (format!("Failed to fetch feed (feed URL: {}): {}", feed_url, e))
+            })?;
 
             let mut body = String::new();
-            response
-                .read_to_string(&mut body)
-                .map_err(|e| (format!("Failed to read feed body (feed URL: {}): {}", feed_url, e)))?;
+            response.read_to_string(&mut body).map_err(|e| {
+                (format!("Failed to read feed body (feed URL: {}): {}", feed_url, e))
+            })?;
 
             Ok(body)
         };
@@ -265,12 +279,14 @@ impl Fetcher for NetFetcher {
                 let feed_urls = feed_urls.clone();
                 let send_chan = send_chan.clone();
                 std::thread::spawn(move || {
-                                       use futures::Sink;
-                                       Self::fetch_thread(logger,
-                                                          client,
-                                                          feed_urls,
-                                                          Arc::new(Mutex::new(send_chan.wait())))
-                                   })
+                    use futures::Sink;
+                    Self::fetch_thread(
+                        logger,
+                        client,
+                        feed_urls,
+                        Arc::new(Mutex::new(send_chan.wait())),
+                    )
+                })
             })
             .collect();
 
@@ -314,9 +330,9 @@ impl Fetcher for MockFetcher {
         let items = self.mock_items
             .into_iter()
             .map(|x| match x {
-                     Err(s) => Err(Error::from(s)),
-                     Ok(x) => Ok(x),
-                 })
+                Err(s) => Err(Error::from(s)),
+                Ok(x) => Ok(x),
+            })
             .collect::<Vec<_>>();
 
         futures::stream::iter(items)
@@ -339,58 +355,59 @@ fn parse_syndication(feed_url: &str, body: &str) -> Result<Feed, Error> {
         Ok(channel) => {
 
             return Ok(Feed {
-                          meta: FeedMeta {
-                              feed_url: String::from(feed_url),
-                              title: String::from(channel.title()),
-                          },
-                          items: channel
-                              .items()
-                              .iter()
-                              .map(|item| -> Result<FeedItem, Error> {
-                Ok(FeedItem {
-                       id: item.guid()
-                           .map(|x| String::from(x.value()))
-                           .or(item.link().map(|x| String::from(x)))
-                           .ok_or(format!("Cannot determine unique identifier for RSS item (feed URL: {})",
-                                          feed_url))?,
-                       title: item.title().map(|x| String::from(x)),
-                       link: item.link().map(|x| String::from(x)),
-                       content: item.content()
-                           .or(item.description())
-                           .map(|x| String::from(x)),
-                   })
-            })
-                              .collect::<Result<_, _>>()?,
-                      });
+                meta: FeedMeta {
+                    feed_url: String::from(feed_url),
+                    title: String::from(channel.title()),
+                },
+                items: channel
+                    .items()
+                    .iter()
+                    .map(|item| -> Result<FeedItem, Error> {
+                        Ok(FeedItem {
+                            id: item.guid()
+                                .map(|x| String::from(x.value()))
+                                .or(item.link().map(|x| String::from(x)))
+                                .ok_or(format!(
+                                    "Cannot determine unique identifier for RSS item (feed URL: {})",
+                                    feed_url
+                                ))?,
+                            title: item.title().map(|x| String::from(x)),
+                            link: item.link().map(|x| String::from(x)),
+                            content: item.content().or(item.description()).map(
+                                |x| String::from(x),
+                            ),
+                        })
+                    })
+                    .collect::<Result<_, _>>()?,
+            });
         }
     }
 
-    let raw = atom_syndication::Feed::from_str(body)
-        .map_err(|e| ((format!("Failed to parse feed (feed URL: {})", feed_url), e)))?;
+    let raw = atom_syndication::Feed::from_str(body).map_err(|e| {
+        ((format!("Failed to parse feed (feed URL: {})", feed_url), e))
+    })?;
 
     Ok(Feed {
-           meta: FeedMeta {
-               feed_url: String::from(feed_url),
-               title: raw.title,
-           },
-           items: raw.entries
-               .into_iter()
-               .map(|entry| {
-        FeedItem {
-            id: entry.id,
-            title: Some(entry.title),
-            link: entry.links.first().map(|x| x.href.clone()),
-            content: entry
-                .content
-                .map(|x| match x {
-                         atom_syndication::Content::Text(x) => x.escape().into_inner(),
-                         atom_syndication::Content::Html(x) => x,
-                         atom_syndication::Content::Xhtml(x) => x.to_string(),
-                     }),
-        }
+        meta: FeedMeta {
+            feed_url: String::from(feed_url),
+            title: raw.title,
+        },
+        items: raw.entries
+            .into_iter()
+            .map(|entry| {
+                FeedItem {
+                    id: entry.id,
+                    title: Some(entry.title),
+                    link: entry.links.first().map(|x| x.href.clone()),
+                    content: entry.content.map(|x| match x {
+                        atom_syndication::Content::Text(x) => x.escape().into_inner(),
+                        atom_syndication::Content::Html(x) => x,
+                        atom_syndication::Content::Xhtml(x) => x.to_string(),
+                    }),
+                }
+            })
+            .collect(),
     })
-               .collect(),
-       })
 }
 
 #[cfg(test)]
@@ -421,12 +438,14 @@ mod tests {
                 feed_url: String::from("http://example.com"),
                 title: String::from("alpha"),
             },
-            items: vec![FeedItem {
-                            id: String::from("golf"),
-                            title: Some(String::from("delta")),
-                            link: Some(String::from("http://echo")),
-                            content: Some(String::from("foxtrot")),
-                        }],
+            items: vec![
+                FeedItem {
+                    id: String::from("golf"),
+                    title: Some(String::from("delta")),
+                    link: Some(String::from("http://echo")),
+                    content: Some(String::from("foxtrot")),
+                },
+            ],
         };
 
         assert_eq!(got, expected);

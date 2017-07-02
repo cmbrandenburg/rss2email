@@ -70,7 +70,8 @@ impl From<String> for Error {
 }
 
 impl<R> From<(ErrorKind, R)> for Error
-    where R: Into<Cow<'static, str>>
+where
+    R: Into<Cow<'static, str>>,
 {
     fn from((kind, reason): (ErrorKind, R)) -> Error {
         Error {
@@ -82,8 +83,9 @@ impl<R> From<(ErrorKind, R)> for Error
 }
 
 impl<E, R> From<(R, E)> for Error
-    where E: Into<Box<std::error::Error>>,
-          R: Into<Cow<'static, str>>
+where
+    E: Into<Box<std::error::Error>>,
+    R: Into<Cow<'static, str>>,
 {
     fn from((reason, cause): (R, E)) -> Error {
         Error {
@@ -95,8 +97,9 @@ impl<E, R> From<(R, E)> for Error
 }
 
 impl<E, R> From<(ErrorKind, R, E)> for Error
-    where E: Into<Box<std::error::Error>>,
-          R: Into<Cow<'static, str>>
+where
+    E: Into<Box<std::error::Error>>,
+    R: Into<Cow<'static, str>>,
 {
     fn from((kind, reason, cause): (ErrorKind, R, E)) -> Error {
         Error {
