@@ -99,10 +99,6 @@ impl Sender for EmailSender {
             "(N/a)",
         );
 
-        if feed_item.content.is_none() {
-            panic!("Got no content for {}", feed_meta.feed_url);
-        }
-
         let item_content = feed_item.content.as_ref().map(|x| x.as_str()).unwrap_or("");
 
         let body = match feed_item.link {
