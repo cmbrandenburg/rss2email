@@ -386,20 +386,18 @@ fn parse_syndication(feed_url: &str, body: &str) -> Result<Feed, Error> {
     Ok(Feed {
         meta: FeedMeta {
             feed_url: String::from(feed_url),
-            title: raw.title,
+            title: String::from(raw.title()),
         },
-        items: raw.entries
-            .into_iter()
+        items: raw.entries()
+            .iter()
             .map(|entry| {
                 FeedItem {
-                    id: entry.id,
-                    title: Some(entry.title),
-                    link: entry.links.first().map(|x| x.href.clone()),
-                    content: entry.content.map(|x| match x {
-                        atom_syndication::Content::Text(x) => x.escape().into_inner(),
-                        atom_syndication::Content::Html(x) => x,
-                        atom_syndication::Content::Xhtml(x) => x.to_string(),
-                    }),
+                    id: String::from(entry.id()),
+                    title: Some(String::from(entry.title())),
+                    link: entry.links().first().map(|x| String::from(x.href())),
+                    content: entry.content().and_then(|x| x.value()).map(
+                        |x| String::from(x),
+                    ),
                 }
             })
             .collect(),
