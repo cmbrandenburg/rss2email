@@ -6,17 +6,17 @@ authors = ["Craig M. Brandenburg <c.m.brandenburg@gmail.com>"]
 [dependencies]
 atom_syndication = "0.5.4"
 byteorder = "1.0"
+chrono = {version = "0.4.0", features = ["serde"]}
 clap = "2.26"
 escapade = "0.0.3"
 futures = "0.1.14"
 lettre = "0.6.2"
-lmdb = "0.7.1"
-lmdb-sys = "0.7.1"
 reqwest = "0.6.2"
 rmp-serde = "0.13.6"
 rss = "0.7.0"
 serde = "1.0"
 serde_derive = "1.0"
+serde_json = "1.0"
 toml = "0.4.5"
 
 [dev-dependencies]

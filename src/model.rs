@@ -1,292 +1,161 @@
-use {Error, FakeDebug, lmdb, lmdb_sys, rmp_serde, std};
-use feed::{Fetcher, Sender};
-use futures;
-use lmdb::{Cursor, Transaction};
+use {Error, FakeDebug, atom_syndication, futures, lettre, reqwest, rss, serde_json, std};
+use chrono::{DateTime, Utc};
+use config::Config;
+use escapade::Escapable;
 use log::{LogKind, LogLevel, Logger};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
-const DB_FEED: &str = "feed";
-const DB_ITEM: &str = "item";
-
-#[derive(Debug, Default)]
-pub struct FetchAndSendOptions {
-    pub feed_urls: Option<HashSet<String>>,
-}
-
-impl FetchAndSendOptions {
-    fn should_fetch(&self, feed_url: &str) -> bool {
-        if let Some(ref m) = self.feed_urls {
-            return m.contains(feed_url);
-        }
-        return true;
-    }
-}
+const NUM_FETCHERS: usize = 32;
+const CHANNEL_CAPACITY: usize = 2 * NUM_FETCHERS;
+const FETCH_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug)]
-pub struct Model {
-    environment: FakeDebug<lmdb::Environment>, // TODO: Need newer lmdb crate for Debug impl
-    db_feed: lmdb::Database,
-    db_item: lmdb::Database,
+pub struct Database {
     path: PathBuf,
+    feeds: HashMap<String, Feed>,
 }
 
-impl Model {
+impl Database {
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
 
         let path = path.as_ref();
 
         match std::fs::metadata(path) {
             Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err((
-                format!("Failed to obtain file metadata (path: {:?})", path),
-                e,
-            ))?,
-            Ok(..) => return Err(format!("Database already exists (path: {:?})", path))?,
+            Err(e) => return Err(
+                Error::new(format!("Failed to obtain file metadata (path: {:?})", path))
+                    .with_cause(e)
+                    .into_error(),
+            ),
+            Ok(..) => return Err(
+                Error::new(format!("Database already exists (path: {:?})", path)).into_error(),
+            ),
         }
 
-        Self::open_impl(path)
+        Ok(Database {
+            path: PathBuf::from(path),
+            feeds: HashMap::new(),
+        })
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
 
         let path = path.as_ref();
 
-        match std::fs::metadata(path) {
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Err(format!(
-                "Database does not exist (path: {:?})",
-                path
-            ))?,
-            Err(e) => return Err((
-                format!("Failed to obtain file metadata (path: {:?})", path),
-                e,
-            ))?,
-            Ok(..) => {}
-        }
-
-        Self::open_impl(path)
-    }
-
-    fn open_impl(path: &Path) -> Result<Self, Error> {
-
-        let environment = lmdb::Environment::new()
-            .set_flags(lmdb::NO_SUB_DIR)
-            .set_max_dbs(2)
-            .open(path)
-            .map_err(|e| {
-                (
-                    format!("Failed to open LMDB environment (path: {:?})", path),
-                    e,
-                )
-            })?;
-
-        let open_db = |environment: &lmdb::Environment, db_name: &str| -> Result<lmdb::Database, Error> {
-            let flags = lmdb::DatabaseFlags::empty();
-            environment.create_db(Some(db_name), flags).map_err(|e| {
-                Error::from((
-                    format!(
-                        "Failed to open LMDB database (path: {:?}, database: {:?}, flags = 0x{:x})",
-                        path,
-                        db_name,
-                        flags.bits()
-                    ),
-                    e,
-                ))
-            })
-        };
-
-        Ok(Model {
-            path: PathBuf::from(path),
-            db_feed: open_db(&environment, DB_FEED)?,
-            db_item: open_db(&environment, DB_ITEM)?,
-            environment: FakeDebug(environment),
-        })
-    }
-
-    fn begin_rw_transaction(&self) -> Result<lmdb::RwTransaction, Error> {
-        self.environment.begin_rw_txn().map_err(|e| {
-            Error::from((
-                format!(
-                    "Failed to begin LMDB read-write transaction (path: {:?})",
-                    self.path
-                ),
-                e,
-            ))
-        })
-    }
-
-    fn begin_ro_transaction(&self) -> Result<lmdb::RoTransaction, Error> {
-        self.environment.begin_ro_txn().map_err(|e| {
-            Error::from((
-                format!(
-                    "Failed to begin LMDB read-only transaction (path: {:?})",
-                    self.path
-                ),
-                e,
-            ))
-        })
-    }
-
-    fn commit_transaction(&self, tx: lmdb::RwTransaction) -> Result<(), Error> {
-        tx.commit().map_err(|e| {
-            Error::from((
-                format!(
-                    "Failed to commit database transaction (path: {:?})",
-                    self.path
-                ),
-                e,
-            ))
-        })
-    }
-
-    fn delete_all_items_for_feed(&self, tx: &mut lmdb::RwTransaction, feed_url: &str) -> Result<(), Error> {
-
-        let mut cursor = tx.open_rw_cursor(self.db_item).map_err(|e| {
-            (
-                format!("Failed to obtain read-write cursor to {:?} table", DB_ITEM),
-                e,
-            )
+        let f = std::fs::File::open(path).map_err(|e| {
+            Error::new(format!("Failed to open database (path: {:?})", path))
+                .with_cause(e)
+                .into_error()
         })?;
 
-        let search_bytes = &DbItemSearch {
-            feed_url: feed_url,
-            item_id: None,
-        }.to_bytes();
+        let feeds = serde_json::from_reader(f).map_err(|e| {
+            Error::new(format!("Database is corrupt (path: {:?})", path))
+                .with_cause(e)
+                .into_error()
+        })?;
 
-        let mut key_bytes = match cursor.get(Some(&search_bytes), None, lmdb_sys::MDB_SET_RANGE) {
-            Err(lmdb::Error::NotFound) => return Ok(()), // nothing to do
-            Err(e) => Err((
-                format!(
-                    "Failed to position cursor to first feed item in {:?} table",
-                    DB_ITEM
-                ),
-                e,
-            ))?,
-            Ok((None, _)) => unreachable!(),
-            Ok((Some(x), _)) => x,
+        Ok(Database {
+            path: PathBuf::from(path),
+            feeds,
+        })
+    }
+
+    pub fn commit(&self) -> Result<(), Error> {
+
+        // This employs the write-sync-rename pattern to guarantee an atomic
+        // update.
+
+        let working_path = {
+            let mut p = self.path.clone();
+            p.set_extension("working");
+            p
         };
 
-        while key_bytes.starts_with(search_bytes) {
-            cursor.del(lmdb::WriteFlags::empty()).map_err(|e| {
-                (
-                    format!("Failed to decode feed item from {:?} table", DB_ITEM),
-                    e,
-                )
-            })?;
+        let mut f = std::fs::File::create(&working_path).map_err(|e| {
+            Error::new(format!(
+                "Failed to create replacement database (path: {:?})",
+                working_path
+            )).with_cause(e)
+                .into_error()
+        })?;
 
-            key_bytes = match cursor.get(None, None, lmdb_sys::MDB_NEXT) {
-                Ok(x) => x.0.unwrap(),
-                Err(lmdb::Error::NotFound) => break,
-                Err(e) => Err((
-                    format!(
-                        "Failed to advance cursor position within {:?} table",
-                        DB_ITEM
-                    ),
-                    e,
-                ))?,
-            };
-        }
+        serde_json::to_writer(f.by_ref(), &self.feeds).map_err(
+            |e| {
+                Error::new(format!(
+                    "Failed to write feeds to database (path: {:?})",
+                    working_path
+                )).with_cause(e)
+                    .into_error()
+            },
+        )?;
+
+        f.write_all(b"\n").map_err(|e| {
+            Error::new(format!(
+                "Failed to write trailing newline to database (path: {:?})",
+                working_path
+            )).with_cause(e)
+                .into_error()
+        })?;
+
+        f.sync_all().map_err(|e| {
+            Error::new(format!(
+                "Failed to sync database to disk (path: {:?})",
+                working_path
+            )).with_cause(e)
+                .into_error()
+        })?;
+
+        std::fs::rename(&working_path, &self.path).map_err(|e| {
+            Error::new(format!(
+                "Failed to replace database (destination: {:?}, source: {:?})",
+                self.path,
+                working_path
+            )).with_cause(e)
+                .into_error()
+        })?;
 
         Ok(())
     }
 
-    pub fn for_each_feed<F>(&self, mut callback: F) -> Result<(), Error>
-    where
-        F: FnMut(&str) -> Result<(), Error>,
-    {
-        let tx = self.begin_ro_transaction()?;
+    pub fn add_feed(&mut self, feed_url: &str) -> Result<(), Error> {
 
-        for (key_bytes, _value_bytes) in
-            tx.open_ro_cursor(self.db_feed)
-                .map_err(|e| {
-                    (format!("Failed to obtain cursor to {:?} table", DB_FEED), e)
-                })?
-                .iter()
-        {
-            let key = DbFeedKey::from_bytes(key_bytes)?;
-            callback(key.feed_url)?;
+        if self.feeds.contains_key(feed_url) {
+            return Err(
+                Error::new(format!(
+                    "Feed already exists in database (feed URL: {:?})",
+                    feed_url
+                )).into_error(),
+            );
         }
+
+        self.feeds.insert(String::from(feed_url), Feed::new());
 
         Ok(())
     }
 
-    pub fn add_feed(&self, feed_url: &str) -> Result<(), Error> {
-
-        let mut tx = self.begin_rw_transaction()?;
-
-        let key = DbFeedKey { feed_url: feed_url };
-        let key_bytes = key.to_bytes();
-
-        match tx.get(self.db_feed, &key_bytes) {
-            Err(lmdb::Error::NotFound) => {}
-            Err(e) => return Err((
-                format!(
-                    "Failed to look up feed in {:?} table (feed URL: {:?})",
-                    DB_FEED,
+    pub fn remove_feed(&mut self, feed_url: &str) -> Result<(), Error> {
+        match self.feeds.remove(feed_url) {
+            None => Err(
+                Error::new(format!(
+                    "Feed does not exist in database (feed URL: {:?})",
                     feed_url
-                ),
-                e,
-            ))?,
-            Ok(..) => return Err((format!("Feed already exists (feed URL: {:?})", feed_url)))?,
+                )).into_error(),
+            ),
+            Some(_) => Ok(()),
         }
-
-        // Normally there won't be any feed items for a nonexistent feed, but,
-        // by deleting them anyway, we guarantee the database is in a valid
-        // state.
-
-        self.delete_all_items_for_feed(&mut tx, feed_url)?;
-
-        let now = std::time::SystemTime::now();
-
-        let value = DbFeedValue { when_added: now };
-        let value_bytes = value.to_bytes();
-
-        tx.put(
-            self.db_feed,
-            &key_bytes,
-            &value_bytes,
-            lmdb::WriteFlags::empty(),
-        ).map_err(|e| {
-                (
-                    format!(
-                        "Failed to add feed to {:?} table (feed URL: {:?})",
-                        DB_FEED,
-                        feed_url
-                    ),
-                    e,
-                )
-            })?;
-
-        self.commit_transaction(tx)
     }
 
-    pub fn remove_feed(&self, feed_url: &str) -> Result<(), Error> {
-
-        let mut tx = self.begin_rw_transaction()?;
-
-        let key = DbFeedKey { feed_url: feed_url };
-        let key_bytes = key.to_bytes();
-
-        match tx.del(self.db_feed, &key_bytes, None) {
-            Err(lmdb::Error::NotFound) => return Err(format!("Feed does not exist (feed URL: {:?})", feed_url))?,
-            Err(e) => return Err((
-                format!(
-                    "Failed to delete feed from {:?} table (feed URL: {:?})",
-                    DB_FEED,
-                    feed_url
-                ),
-                e,
-            ))?,
-            Ok(..) => {}
-        }
-
-        self.delete_all_items_for_feed(&mut tx, feed_url)?;
-        self.commit_transaction(tx)
+    pub fn feed_urls<'a>(&'a self) -> Box<Iterator<Item = &'a str> + 'a> {
+        Box::new(self.feeds.iter().map(|(k, _)| k.as_str()))
     }
 
     pub fn fetch_and_send_feeds<F, S>(
-        &self,
+        &mut self,
         logger: Arc<Logger>,
         fetcher: F,
         sender: &S,
@@ -296,331 +165,580 @@ impl Model {
         F: Fetcher,
         S: Sender,
     {
-        // Even though this is a long-running operation, we do it within a
-        // single transaction so that there are no race conditions with other
-        // processes mucking around with the database.
-
-        let mut tx = self.begin_rw_transaction()?;
-
-        {
-            let now = std::time::SystemTime::now();
-
-            // First collect all feeds to fetch. We must collect these in memory
-            // so that we're then free to modify the database to update the
-            // feeds' states. I.e., we can't read the feeds from the database while
-            // simultaneously modifying the database.
-
-            let feeds_to_fetch = tx.open_ro_cursor(self.db_feed)
-                .map_err(|e| {
-                    (format!("Failed to obtain cursor to {:?} table", DB_FEED), e)
-                })?
-                .iter()
-                .map(|(key_bytes, _value_bytes)| -> Result<String, Error> {
-                    Ok(String::from(DbFeedKey::from_bytes(key_bytes)?.feed_url))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|feed_url| options.should_fetch(feed_url))
-                .collect::<Vec<_>>();
-
-            if let Some(ref filter) = options.feed_urls {
-                for f in filter {
-                    if feeds_to_fetch.iter().all(|g| f != g) {
-                        return Err(format!("Feed URL {} does not exist in the database", f))?;
-                    }
-                }
-            }
-
-            // Pump the fetcher for the feeds it receives. Send each item we
-            // receive. Update the database state as we go.
-
-            let mut spawn = futures::executor::spawn(fetcher.fetch(logger.clone(), feeds_to_fetch));
-            while let Some(fetch_result) = spawn.wait_stream() {
-
-                let feed = match fetch_result {
-                    Err(e) => {
-                        logger.log(LogLevel::Important, LogKind::Error, e);
-                        break;;
-                    }
-                    Ok(x) => x,
-                };
-
-                // Don't send items we've previously received. But update the
-                // `when_last_fetched` value in the database.
-
-                for item in &feed.items {
-
-                    let item_key_bytes = DbItemKey {
-                        feed_url: &feed.meta.feed_url,
-                        item_id: &item.id,
-                    }.to_bytes();
-
-                    let item_value = match tx.get(self.db_item, &item_key_bytes) {
-                        Ok(item_value_bytes) => {
-                            let mut item_value = DbItemValue::from_bytes(item_value_bytes)?;
-                            item_value.when_last_fetched = now;
-                            Some(item_value)
-                        }
-                        Err(lmdb::Error::NotFound) => None,
-                        Err(e) => Err((
-                            format!(
-                                "Failed to look up feed item in {:?} table",
-                                DB_ITEM
-                            ),
-                            e,
-                        ))?,
-                    };
-
-                    if let Some(item_value) = item_value {
-                        tx.put(
-                            self.db_item,
-                            &item_key_bytes,
-                            &item_value.to_bytes(),
-                            lmdb::WriteFlags::empty(),
-                        ).map_err(|e| {
-                                (
-                                    format!("Failed to update feed item in {:?} table", DB_ITEM),
-                                    e,
-                                )
-                            })?;
-                        continue;
-                    }
-
-                    // Send (the new feed item).
-
-                    match sender.send(&logger, &feed.meta, &item) {
-                        Err(e) => {
-                            logger.log(
-                                LogLevel::Important,
-                                LogKind::Error,
-                                format!(
-                                    "An error occurred while sending (feed id = {}): {}",
-                                    item.id,
-                                    e
-                                ),
-                            );
-                            break;
-                        }
-                        Ok(..) => {
-
-                            let item_value_bytes = DbItemValue {
-                                when_first_fetched: now,
-                                when_last_fetched: now,
-                            }.to_bytes();
-
-                            tx.put(
-                                self.db_item,
-                                &item_key_bytes,
-                                &item_value_bytes,
-                                lmdb::WriteFlags::empty(),
-                            ).map_err(|e| {
-                                    (
-                                        format!(
-                                            "Failed to add feed item to {:?} table (feed URL: {:?}, feed item = {:?})",
-                                            DB_ITEM,
-                                            feed.meta.feed_url,
-                                            item
-                                        ),
-                                        e,
-                                    )
-                                })?;
-                        }
-                    }
-                }
-            }
+        fn item_ids(feed: &Feed) -> HashSet<String> {
+            feed.items.keys().map(|x| x.clone()).collect()
         }
 
-        self.commit_transaction(tx)
-    }
-}
+        // Pump the fetcher for the feeds it receives. Send each *new* item we
+        // receive. Update database state as we go.
+        //
+        // In case of error, stop all processing. Make sure that the database
+        // reflects all sent items but no unsent items.
 
-#[derive(Debug)]
-struct DbFeedKey<'a> {
-    feed_url: &'a str,
-}
+        let feeds_to_fetch = self.feeds
+            .keys()
+            .filter(|x| options.should_fetch(x))
+            .map(|x| x.clone())
+            .collect::<Vec<_>>();
 
-impl<'a> DbFeedKey<'a> {
-    fn from_bytes(source: &'a [u8]) -> Result<Self, Error> {
-        let feed_url = std::str::from_utf8(source).map_err(|e| {
-            (
-                format!(
-                    "Failed to decode feed key from database (source: {:?})",
-                    source
-                ),
-                e,
-            )
-        })?;
-        Ok(DbFeedKey { feed_url: feed_url })
-    }
+        let mut spawn = futures::executor::spawn(fetcher.fetch(logger.clone(), feeds_to_fetch));
+        'outer: while let Some(fetch_result) = spawn.wait_stream() {
 
-    fn to_bytes(&self) -> &'a [u8] {
-        self.feed_url.as_bytes()
-    }
-}
+            let (feed_url, mut new_feed) = match fetch_result {
+                Err(e) => {
+                    logger.log(LogLevel::Important, LogKind::Error, e);
+                    break;
+                }
+                Ok(x) => x,
+            };
 
-#[derive(Debug)]
-struct DbFeedValue {
-    when_added: std::time::SystemTime,
-}
+            let new_item_ids = item_ids(&new_feed);
 
-#[derive(Debug, Deserialize, Serialize)]
-struct DbFeedValueSerial {
-    when_added: (u64, u32), // (seconds, sub-second nanoseconds) since epoch
-}
+            let old_feed = self.feeds.get_mut(&feed_url).unwrap();
+            let old_item_ids = item_ids(&old_feed);
 
-impl DbFeedValue {
-    fn to_bytes(&self) -> Vec<u8> {
-        let (secs, nanos) = system_time_to_parts(self.when_added);
-        rmp_serde::to_vec(&DbFeedValueSerial { when_added: (secs, nanos) }).unwrap()
-    }
-}
+            if old_feed.title != new_feed.title && new_feed.title.is_some() {
+                old_feed.title = new_feed.title.clone();
+            }
 
-#[derive(Debug)]
-struct DbItemKey<'a> {
-    feed_url: &'a str,
-    item_id: &'a str,
-}
+            for item_id in new_item_ids.difference(&old_item_ids).collect::<Vec<_>>() {
 
-#[derive(Debug)]
-struct DbItemSearch<'a> {
-    feed_url: &'a str,
-    item_id: Option<&'a str>,
-}
+                let item = new_feed.items.remove(item_id).unwrap();
 
-impl<'a> DbItemKey<'a> {
-    /*
-    fn from_bytes(source: &'a [u8]) -> Result<Self, Error> {
-        let mut split = source.splitn(2, |&c| c == 0);
-        let feed_url = std::str::from_utf8(split.next().unwrap())
-            .map_err(|e| {
-                         (format!("Failed to decode feed item feed URL field (source: {:?})",
-                                  source),
-                          e)
-                     })?;
-        let item_id =
-            std::str::from_utf8(split
-                                    .next()
-                                    .ok_or(format!("Feed item in database is missing field separator (source: {:?})",
-                                                   source))?)
-                    .map_err(|e| {
-                                 (format!("Failed to decode feed item feed id field (source: {:?})",
-                                          source),
-                                  e)
-                             })?;
-        Ok(DbItemKey {
-               feed_url: feed_url,
-               item_id: item_id,
-           })
-    }
-    */
-
-    fn to_bytes(&self) -> Vec<u8> {
-        DbItemSearch {
-            feed_url: self.feed_url,
-            item_id: Some(self.item_id),
-        }.to_bytes()
-    }
-}
-
-impl<'a> DbItemSearch<'a> {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::new();
-        v.extend(self.feed_url.as_bytes());
-        v.push(0);
-        if let Some(item_id) = self.item_id {
-            v.extend(item_id.as_bytes())
-        }
-        v
-    }
-}
-
-#[derive(Debug)]
-struct DbItemValue {
-    when_first_fetched: std::time::SystemTime,
-    when_last_fetched: std::time::SystemTime,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct DbItemValueSerial {
-    when_first_fetched: (u64, u32),
-    when_last_fetched: (u64, u32),
-}
-
-impl DbItemValue {
-    fn from_bytes(source: &[u8]) -> Result<Self, Error> {
-        let x = rmp_serde::from_slice::<DbItemValueSerial>(source).map_err(
-            |e| {
-                Error::from((
+                logger.log(
+                    LogLevel::Verbose,
+                    LogKind::Info,
                     format!(
-                        "Failed to decode feed item from database (source: {:?})",
-                        source
+                        "{} {} — {:?}",
+                        if options.no_send { "Not sending" } else { "Sending" },
+                        feed_url,
+                        item.title.as_ref().map(|x| x.as_str()).unwrap_or("n/a")
                     ),
-                    e,
-                ))
-            },
-        )?;
-        Ok(DbItemValue {
-            when_first_fetched: system_time_from_parts(x.when_first_fetched.0, x.when_first_fetched.1),
-            when_last_fetched: system_time_from_parts(x.when_last_fetched.0, x.when_last_fetched.1),
+                );
+
+                if !options.no_send {
+                    if let Err(e) = sender.send(&feed_url, &new_feed, &item_id, &item) {
+                        logger.log(
+                            LogLevel::Important,
+                            LogKind::Error,
+                            format!(
+                                "An error occurred while sending (feed id = {}): {}",
+                                item_id,
+                                e
+                            ),
+                        );
+                        break 'outer; // stop all processing
+                    }
+                }
+
+                old_feed.items.insert(item_id.clone(), item);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Feed {
+    title: Option<String>,
+    items: HashMap<String, FeedItem>, // id to item
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FeedItem {
+    last_observed: DateTime<Utc>,
+    #[serde(skip_serializing)]
+    title: Option<String>,
+    #[serde(skip_serializing)]
+    link: Option<String>,
+    #[serde(skip_serializing)]
+    content: Option<String>,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Feed {
+            title: None,
+            items: HashMap::new(),
+        }
+    }
+}
+
+pub trait Sender {
+    fn send(&self, feed_url: &str, feed: &Feed, feed_item_id: &str, feed_item: &FeedItem) -> Result<(), Error>;
+}
+
+#[derive(Debug)]
+pub struct EmailSender {
+    config: Config,
+    mail_client: FakeDebug<Mutex<lettre::transport::smtp::SmtpTransport>>, // TODO: Need newer lettre crate for Debug impl
+    no_send: bool,
+}
+
+impl EmailSender {
+    pub fn new(config: &Config) -> Result<Self, Error> {
+
+        let mail_client = lettre::transport::smtp::SmtpTransportBuilder::new(&config.smtp_server)
+            .map_err(|e| {
+                Error::new("Failed to construct mail client")
+                    .with_cause(e)
+                    .into_error()
+            })?
+            .credentials(&config.smtp_username, &config.smtp_password)
+            .security_level(lettre::transport::smtp::SecurityLevel::AlwaysEncrypt)
+            .build();
+
+        Ok(EmailSender {
+            config: config.clone(),
+            mail_client: FakeDebug(Mutex::new(mail_client)),
+            no_send: false,
         })
     }
+}
 
-    fn to_bytes(&self) -> Vec<u8> {
-        let t1 = system_time_to_parts(self.when_first_fetched);
-        let t2 = system_time_to_parts(self.when_last_fetched);
-        rmp_serde::to_vec(&DbItemValueSerial {
-            when_first_fetched: (t1.0, t1.1),
-            when_last_fetched: (t2.0, t2.1),
-        }).unwrap()
+impl Sender for EmailSender {
+    fn send(&self, feed_url: &str, feed: &Feed, feed_item_id: &str, feed_item: &FeedItem) -> Result<(), Error> {
+
+        use lettre::transport::EmailTransport;
+
+        let item_title = feed_item.title.as_ref().map(|x| x.as_str()).unwrap_or(
+            "(N/a)",
+        );
+
+        let item_content = feed_item.content.as_ref().map(|x| x.as_str()).unwrap_or("");
+
+        let body = match feed_item.link {
+            None => format!(
+                r#"<h1>{}</h1>{}"#,
+                item_title.escape().into_inner(),
+                item_content
+            ),
+            Some(ref link) => format!(
+                r#"<h1><a href="{}">{}</a></h1>{}<p><a href="{}">{}</a></p>"#,
+                link.escape().into_inner(),
+                item_title.escape().into_inner(),
+                item_content,
+                link.escape().into_inner(),
+                link.escape().into_inner()
+            ),
+        };
+
+        let email = lettre::email::EmailBuilder::new()
+            .to(self.config.recipient.as_ref())
+            .from((
+                self.config.smtp_username.as_ref(),
+                feed.title.as_ref().map(|x| x.as_ref()).unwrap(),
+            ))
+            .subject(&item_title)
+            .header(("Content-Type", "text/html"))
+            .body(&body)
+            .build()
+            .map_err(|e| {
+                Error::new("Failed to construct email message")
+                    .with_cause(e)
+                    .into_error()
+            })?;
+
+        /*
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        writeln!(stdout.lock(), "Sending {:?}", email).unwrap();
+        */
+
+        if !self.no_send {
+            self.mail_client.lock().unwrap().send(email).map_err(|e| {
+                Error::new(format!(
+                    "Failed to send email (feed url: {}, feed item id: {})",
+                    feed_url,
+                    feed_item_id
+                )).with_cause(e)
+                    .into_error()
+            })?;
+        }
+
+        Ok(())
     }
 }
 
-fn system_time_to_parts(t: std::time::SystemTime) -> (u64, u32) {
-    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
-    (d.as_secs(), d.subsec_nanos())
+pub trait Fetcher {
+    type Stream: futures::Stream<Item = (String, Feed), Error = Error>;
+    fn fetch(self, logger: Arc<Logger>, feed_urls: Vec<String>) -> Self::Stream;
 }
 
-fn system_time_from_parts(secs: u64, subsec_nanos: u32) -> std::time::SystemTime {
-    std::time::UNIX_EPOCH + std::time::Duration::new(secs, subsec_nanos)
+#[derive(Debug, Default)]
+pub struct FetchAndSendOptions {
+    feed_urls: Option<HashSet<String>>,
+    no_send: bool,
+}
+
+impl FetchAndSendOptions {
+    pub fn new() -> Self {
+        FetchAndSendOptions {
+            feed_urls: None,
+            no_send: false,
+        }
+    }
+
+    pub fn with_feed_urls<I: IntoIterator<Item = S>, S: Into<String>>(&mut self, feed_urls: I) -> &mut Self {
+        self.feed_urls = Some(feed_urls.into_iter().map(|x| x.into()).collect());
+        self
+    }
+
+    pub fn with_no_send(&mut self, no_send: bool) -> &mut Self {
+        self.no_send = no_send;
+        self
+    }
+
+    fn should_fetch(&self, feed_url: &str) -> bool {
+        if let Some(ref m) = self.feed_urls {
+            return m.contains(feed_url);
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+pub struct NetFetcher {
+    client: Arc<Mutex<reqwest::Client>>,
+}
+
+impl NetFetcher {
+    pub fn new() -> Result<Self, Error> {
+
+        let mut client = reqwest::Client::new().map_err(|e| {
+            Error::new("Failed to construct HTTP client")
+                .with_cause(e)
+                .into_error()
+        })?;
+
+        client.timeout(std::time::Duration::new(FETCH_TIMEOUT_SECS, 0));
+
+        Ok(NetFetcher { client: Arc::new(Mutex::new(client)) })
+    }
+
+    // It's kinda poor to wrap a channel in an Arc<Mutex<>>, but we need the
+    // Sync and Send traits.
+    fn fetch_thread(
+        logger: Arc<Logger>,
+        client: Arc<Mutex<reqwest::Client>>,
+        feed_urls: Arc<Mutex<Vec<String>>>,
+        send_chan: Arc<Mutex<futures::sink::Wait<futures::sync::mpsc::Sender<Result<(String, Feed), String>>>>>,
+    ) {
+
+        let fetch_it = |feed_url: &str| -> Result<String, Error> {
+
+            use std::io::Read;
+
+            logger.log(
+                LogLevel::Normal,
+                LogKind::Info,
+                format!("Fetching {}", feed_url),
+            );
+
+            let request = {
+                client.lock().unwrap().get(feed_url)
+            };
+
+            let mut response = request.send().map_err(|e| {
+                Error::new(format!("Failed to fetch feed (feed URL: {})", feed_url))
+                    .with_cause(e)
+                    .into_error()
+            })?;
+
+            let mut body = String::new();
+            response.read_to_string(&mut body).map_err(|e| {
+                Error::new(format!("Failed to read feed body (feed URL: {})", feed_url))
+                    .with_cause(e)
+                    .into_error()
+            })?;
+
+            Ok(body)
+        };
+
+        loop {
+            let feed_url = match feed_urls.lock().unwrap().pop() {
+                None => return, // no more feeds to fetch
+                Some(x) => x,
+            };
+
+            // As soon as the channel closes, exit this thread.
+
+            match fetch_it(&feed_url) {
+                Err(e) => {
+                    match send_chan.lock().unwrap().send(Err(e.to_string())) {
+                        Err(_) => return, // channel closed
+                        Ok(_) => {}
+                    }
+                }
+                Ok(body) => {
+
+                    let feed = match parse_syndication(&feed_url, &body) {
+                        Err(e) => {
+                            logger.log(LogLevel::Important, LogKind::Error, e);
+                            continue;
+                        }
+                        Ok(x) => x,
+                    };
+
+                    match send_chan.lock().unwrap().send(Ok((feed_url, feed))) {
+                        Err(_) => return, // channel closed
+                        Ok(_) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Fetcher for NetFetcher {
+    type Stream = NetFetcherStream;
+    fn fetch(self, logger: Arc<Logger>, feed_urls: Vec<String>) -> Self::Stream {
+
+        // We use (possibly) multiple fetcher threads, each of which sends
+        // the feeds it receives through a channel to the stream poller.
+
+        let feed_urls = Arc::new(Mutex::new(feed_urls));
+        let (send_chan, recv_chan) = futures::sync::mpsc::channel(CHANNEL_CAPACITY);
+
+        let threads = (0..NUM_FETCHERS)
+            .into_iter()
+            .map(|_| {
+                let logger = logger.clone();
+                let client = self.client.clone();
+                let feed_urls = feed_urls.clone();
+                let send_chan = send_chan.clone();
+                std::thread::spawn(move || {
+                    use futures::Sink;
+                    Self::fetch_thread(
+                        logger,
+                        client,
+                        feed_urls,
+                        Arc::new(Mutex::new(send_chan.wait())),
+                    )
+                })
+            })
+            .collect();
+
+        NetFetcherStream {
+            threads: threads,
+            recv_chan: recv_chan,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NetFetcherStream {
+    threads: Vec<std::thread::JoinHandle<()>>,
+    recv_chan: futures::sync::mpsc::Receiver<Result<(String, Feed), String>>,
+}
+
+impl futures::Stream for NetFetcherStream {
+    type Item = (String, Feed);
+    type Error = Error;
+    fn poll(&mut self) -> futures::Poll<Option<Self::Item>, Self::Error> {
+        match self.recv_chan.poll().unwrap() {
+            futures::Async::NotReady => Ok(futures::Async::NotReady),
+            futures::Async::Ready(None) => Ok(futures::Async::Ready(None)),
+            futures::Async::Ready(Some(Err(e))) => Err(Error::new(e).into_error()),
+            futures::Async::Ready(Some(Ok(x))) => Ok(futures::Async::Ready(Some(x))),
+        }
+    }
+}
+
+fn parse_syndication(feed_url: &str, body: &str) -> Result<Feed, Error> {
+
+    // First try as RSS, then as Atom.
+
+    match rss::Channel::read_from(std::io::Cursor::new(body)) {
+        Err(..) => {}
+        Ok(channel) => {
+            return Ok(Feed {
+                title: Some(String::from(channel.title())),
+                items: channel
+                    .items()
+                    .iter()
+                    .map(|item| -> Result<(String, FeedItem), Error> {
+                        let id = item.guid()
+                            .map(|x| String::from(x.value()))
+                            .or(item.link().map(|x| String::from(x)))
+                            .ok_or(
+                                Error::new(format!(
+                                    "Cannot determine unique identifier for RSS item (feed URL: {})",
+                                    feed_url
+                                )).into_error(),
+                            )?;
+                        Ok((
+                            id,
+                            FeedItem {
+                                last_observed: DateTime::from(SystemTime::now()),
+                                title: item.title().map(|x| String::from(x)),
+                                link: item.link().map(|x| String::from(x)),
+                                content: item.content().or(item.description()).map(
+                                    |x| String::from(x),
+                                ),
+                            },
+                        ))
+                    })
+                    .collect::<Result<_, _>>()?,
+            });
+        }
+    }
+
+    let raw = atom_syndication::Feed::from_str(body).map_err(|e| {
+        Error::new(format!("Failed to parse feed (feed URL: {})", feed_url))
+            .with_cause(e)
+            .into_error()
+    })?;
+
+    Ok(Feed {
+        title: Some(String::from(raw.title())),
+        items: raw.entries()
+            .iter()
+            .map(|entry| {
+                (
+                    String::from(entry.id()),
+                    FeedItem {
+                        last_observed: DateTime::from(SystemTime::now()),
+                        title: Some(String::from(entry.title())),
+                        link: entry.links().first().map(|x| String::from(x.href())),
+                        content: entry.content().and_then(|x| x.value()).map(
+                            |x| String::from(x),
+                        ),
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feed::{Feed, FeedItem, FeedMeta, MockFetcher, RecorderSender};
     use tempdir::TempDir;
 
     const TEST_PATH_PREFIX: &str = "rss2email";
 
-    #[test]
-    fn creating_a_model_requires_it_to_not_exist() {
-        let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
-        let db_path = tdir.path().join("foo");
-        Model::create(&db_path).unwrap();
-        Model::create(&db_path).unwrap_err();
+    #[derive(Debug)]
+    pub struct RecorderSender {
+        recorded_items: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecorderSender {
+        pub fn new() -> Self {
+            RecorderSender { recorded_items: Mutex::new(Vec::new()) }
+        }
+
+        pub fn recorded_items(self) -> Vec<(String, String)> {
+            self.recorded_items.into_inner().unwrap()
+        }
+    }
+
+    impl Sender for RecorderSender {
+        fn send(&self, feed_url: &str, _feed: &Feed, feed_item_id: &str, _feed_item: &FeedItem) -> Result<(), Error> {
+            self.recorded_items.lock().unwrap().push((
+                String::from(feed_url),
+                String::from(
+                    feed_item_id,
+                ),
+            ));
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct MockFetcher {
+        mock_items: Vec<Result<(String, Feed), String>>,
+    }
+
+    impl Fetcher for MockFetcher {
+        type Stream = futures::stream::Iter<std::vec::IntoIter<Result<(String, Feed), Error>>>;
+        fn fetch(self, _logger: Arc<Logger>, _feed_urls: Vec<String>) -> Self::Stream {
+
+            let items = self.mock_items
+                .into_iter()
+                .map(|x| match x {
+                    Err(s) => Err(Error::new(s).into_error()),
+                    Ok(x) => Ok(x),
+                })
+                .collect::<Vec<_>>();
+
+            futures::stream::iter(items)
+        }
+    }
+
+    impl From<Vec<Result<(String, Feed), String>>> for MockFetcher {
+        fn from(mock_items: Vec<Result<(String, Feed), String>>) -> Self {
+            MockFetcher { mock_items: mock_items }
+        }
     }
 
     #[test]
-    fn opening_a_model_requires_it_to_exist() {
+    fn rss_content_is_in_description() {
+
+        let source = r#"<rss version="2.0">
+<channel>
+<title>alpha</title>
+<link>http://bravo</link>
+<description>charlie</description>
+<item>
+<title>delta</title>
+<link>http://echo</link>
+<description>foxtrot</description>
+<guid>golf</guid>
+</item>
+</channel>
+</rss>"#;
+
+        let got = super::parse_syndication("http://example.com", source).unwrap();
+
+        let expected = Feed {
+            title: Some(String::from("alpha")),
+            items: vec![
+                (
+                    String::from("golf"),
+                    FeedItem {
+                        last_observed: got.items.get("golf").unwrap().last_observed,
+                        title: Some(String::from("delta")),
+                        link: Some(String::from("http://echo")),
+                        content: Some(String::from("foxtrot")),
+                    }
+                ),
+            ].into_iter()
+                .collect(),
+        };
+
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn creating_a_database_requires_it_to_not_exist() {
         let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
         let db_path = tdir.path().join("foo");
-        Model::open(&db_path).unwrap_err();
-        Model::create(&db_path).unwrap();
-        Model::open(&db_path).unwrap();
+        Database::create(&db_path).unwrap().commit().unwrap();
+        Database::create(&db_path).unwrap_err();
+    }
+
+    #[test]
+    fn opening_a_database_requires_it_to_exist() {
+        let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
+        let db_path = tdir.path().join("foo");
+        Database::open(&db_path).unwrap_err();
+        Database::create(&db_path).unwrap().commit().unwrap();
+        Database::open(&db_path).unwrap();
     }
 
     #[test]
     fn adding_a_feed_requires_it_to_not_exist() {
         let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
-        let db = Model::create(&tdir.path().join("foo")).unwrap();
+        let mut db = Database::create(&tdir.path().join("foo")).unwrap();
         db.add_feed("https://xkcd.com/rss.xml").unwrap();
-        // db.add_feed("https://xkcd.com/rss.xml").unwrap_err();
     }
 
     #[test]
     fn removing_a_feed_requires_it_to_exist() {
         let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
-        let db = Model::create(&tdir.path().join("foo")).unwrap();
+        let mut db = Database::create(&tdir.path().join("foo")).unwrap();
         db.remove_feed("https://xkcd.com/rss.xml").unwrap_err();
         db.add_feed("https://xkcd.com/rss.xml").unwrap();
         db.remove_feed("https://xkcd.com/rss.xml").unwrap();
@@ -630,25 +748,29 @@ mod tests {
     fn only_new_feed_items_are_sent() {
 
         let tdir = TempDir::new(TEST_PATH_PREFIX).unwrap();
-        let db = Model::create(&tdir.path().join("foo")).unwrap();
+        let mut db = Database::create(&tdir.path().join("foo")).unwrap();
         db.add_feed("http://example.com").unwrap();
         let logger = Arc::new(Logger::new(LogLevel::Nothing));
 
         let fetcher = MockFetcher::from(vec![
-            Ok(Feed {
-                meta: FeedMeta {
-                    feed_url: String::from("http://example.com"),
-                    title: String::from("Example"),
+            Ok((
+                String::from("http://example.com"),
+                Feed {
+                    title: Some(String::from("Example")),
+                    items: vec![
+                        (
+                            String::from("id alpha"),
+                            FeedItem {
+                                last_observed: DateTime::from(SystemTime::now()),
+                                title: Some(String::from("entry alpha")),
+                                link: Some(String::from("http://example.com/alpha")),
+                                content: Some(String::from("blah blah blah")),
+                            }
+                        ),
+                    ].into_iter()
+                        .collect(),
                 },
-                items: vec![
-                    FeedItem {
-                        id: String::from("id alpha"),
-                        title: Some(String::from("entry alpha")),
-                        link: Some(String::from("http://example.com/alpha")),
-                        content: Some(String::from("blah blah blah")),
-                    },
-                ],
-            }),
+            )),
         ]);
 
         let sender = RecorderSender::new();
@@ -662,18 +784,7 @@ mod tests {
         assert_eq!(
             got_items,
             &[
-                (
-                    FeedMeta {
-                        feed_url: String::from("http://example.com"),
-                        title: String::from("Example"),
-                    },
-                    FeedItem {
-                        id: String::from("id alpha"),
-                        title: Some(String::from("entry alpha")),
-                        link: Some(String::from("http://example.com/alpha")),
-                        content: Some(String::from("blah blah blah")),
-                    },
-                ),
+                (String::from("http://example.com"), String::from("id alpha")),
             ]
         );
 

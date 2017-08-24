@@ -1,24 +1,23 @@
 extern crate atom_syndication;
 extern crate byteorder;
+extern crate chrono;
 extern crate clap;
 extern crate escapade;
 extern crate futures;
 extern crate lettre;
-extern crate lmdb;
-extern crate lmdb_sys;
 extern crate reqwest;
 extern crate rmp_serde;
 extern crate rss;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
 #[cfg(test)]
 extern crate tempdir;
 extern crate toml;
 
 mod config;
 mod error;
-mod feed;
 mod log;
 mod model;
 
@@ -54,7 +53,7 @@ impl<T> std::ops::DerefMut for FakeDebug<T> {
 fn main_impl() -> Result<(), Error> {
 
     use clap::{App, Arg, SubCommand};
-    use model::Model;
+    use model::Database;
 
     let matches = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
@@ -70,18 +69,8 @@ fn main_impl() -> Result<(), Error> {
                 ),
         )
         .subcommand(SubCommand::with_name("create").about("Create database"))
-        .subcommand(SubCommand::with_name("list").about("Print all feed URLs"))
         .subcommand(
-            SubCommand::with_name("remove")
-                .about("Remove a feed from the database")
-                .arg(
-                    Arg::with_name("FEED_URL")
-                        .help("URL of the feed to remove")
-                        .required(true),
-                ),
-        )
-        .subcommand(
-            SubCommand::with_name("run")
+            SubCommand::with_name("fetch")
                 .about("Fetch feeds and send emails for new items")
                 .arg(
                     Arg::with_name("VERBOSE")
@@ -94,54 +83,58 @@ fn main_impl() -> Result<(), Error> {
                     "Run as normal but do not send emails",
                 ))
                 .arg(Arg::with_name("FEED_URL").multiple(true).help(
-                    "URL of the feed(s) to run",
+                    "URL of the feed(s) to fetch",
                 )),
+        )
+        .subcommand(SubCommand::with_name("list").about("Print all feed URLs"))
+        .subcommand(
+            SubCommand::with_name("remove")
+                .about("Remove a feed from the database")
+                .arg(
+                    Arg::with_name("FEED_URL")
+                        .help("URL of the feed to remove")
+                        .required(true),
+                ),
         )
         .get_matches();
 
     if let Some(matches) = matches.subcommand_matches("add") {
         let feed_url = matches.value_of("FEED_URL").unwrap();
-        let model = Model::open(DB_PATH)?;
-        model.add_feed(feed_url)?;
+        let mut db = Database::open(DB_PATH)?;
+        db.add_feed(feed_url)?;
+        db.commit()?;
     } else if let Some(_matches) = matches.subcommand_matches("create") {
-        Model::create(DB_PATH)?;
-    } else if let Some(_matches) = matches.subcommand_matches("list") {
-        let model = Model::open(DB_PATH)?;
-        let stdout = std::io::stdout();
-        let mut w = stdout.lock();
-        model.for_each_feed(|feed_url| {
-            writeln!(w, "{}", feed_url).unwrap();
-            Ok(())
-        })?;
-    } else if let Some(matches) = matches.subcommand_matches("remove") {
-        let feed_url = matches.value_of("FEED_URL").unwrap();
-        let model = Model::open(DB_PATH)?;
-        model.remove_feed(feed_url)?;
-    } else if let Some(matches) = matches.subcommand_matches("run") {
+        let db = Database::create(DB_PATH)?;
+        db.commit()?;
+    } else if let Some(matches) = matches.subcommand_matches("fetch") {
         let config = config::Config::load(CONFIG_PATH)?;
-        let model = Model::open(DB_PATH)?;
+        let mut db = Database::open(DB_PATH)?;
         let log_level = match matches.occurrences_of("VERBOSE") {
             0 => log::LogLevel::Normal,
             _ => log::LogLevel::Verbose,
         };
         let logger = Arc::new(log::Logger::new(log_level));
-        let fetcher = feed::NetFetcher::new()?;
-        let sender = feed::EmailSender::new(&config)?.with_no_send(
-            matches.is_present(
-                "NO_SEND",
-            ),
-        );
-        let options = model::FetchAndSendOptions {
-            feed_urls: matches.values_of("FEED_URL").map(|x| {
-                x.map(|x| String::from(x)).collect()
-            }),
-        };
-        model.fetch_and_send_feeds(
-            logger,
-            fetcher,
-            &sender,
-            &options,
-        )?;
+        let fetcher = model::NetFetcher::new()?;
+        let sender = model::EmailSender::new(&config)?;
+        let mut options = model::FetchAndSendOptions::new();
+        options.with_no_send(matches.is_present("NO_SEND"));
+        if let Some(feed_urls) = matches.values_of("FEED_URL") {
+            options.with_feed_urls(feed_urls);
+        }
+        db.fetch_and_send_feeds(logger, fetcher, &sender, &options)?;
+        db.commit()?;
+    } else if let Some(_matches) = matches.subcommand_matches("list") {
+        let db = Database::open(DB_PATH)?;
+        let stdout = std::io::stdout();
+        let mut w = stdout.lock();
+        for feed_url in db.feed_urls() {
+            writeln!(w, "{}", feed_url).unwrap();
+        }
+    } else if let Some(matches) = matches.subcommand_matches("remove") {
+        let feed_url = matches.value_of("FEED_URL").unwrap();
+        let mut db = Database::open(DB_PATH)?;
+        db.remove_feed(feed_url)?;
+        db.commit()?;
     } else {
         unreachable!();
     }
