@@ -55,7 +55,7 @@ fn main_impl() -> Result<(), Error> {
     use clap::{App, Arg, SubCommand};
     use model::Database;
 
-    let matches = App::new(env!("CARGO_PKG_NAME"))
+    let mut app = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
@@ -95,8 +95,9 @@ fn main_impl() -> Result<(), Error> {
                         .help("URL of the feed to remove")
                         .required(true),
                 ),
-        )
-        .get_matches();
+        );
+
+    let matches = app.clone().get_matches();
 
     if let Some(matches) = matches.subcommand_matches("add") {
         let feed_url = matches.value_of("FEED_URL").unwrap();
@@ -136,7 +137,8 @@ fn main_impl() -> Result<(), Error> {
         db.remove_feed(feed_url)?;
         db.commit()?;
     } else {
-        unreachable!();
+        app.print_help().unwrap();
+        println!(); // print_help omits final newline
     }
 
     Ok(())
