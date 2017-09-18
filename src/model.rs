@@ -165,10 +165,6 @@ impl Database {
         F: Fetcher,
         S: Sender,
     {
-        fn item_ids(feed: &Feed) -> HashSet<String> {
-            feed.items.keys().map(|x| x.clone()).collect()
-        }
-
         // Pump the fetcher for the feeds it receives. Send each *new* item we
         // receive. Update database state as we go.
         //
@@ -184,7 +180,7 @@ impl Database {
         let mut spawn = futures::executor::spawn(fetcher.fetch(logger.clone(), feeds_to_fetch));
         'outer: while let Some(fetch_result) = spawn.wait_stream() {
 
-            let (feed_url, mut new_feed) = match fetch_result {
+            let (feed_url, new_feed) = match fetch_result {
                 Err(e) => {
                     logger.log(LogLevel::Important, LogKind::Error, e);
                     break;
@@ -192,18 +188,38 @@ impl Database {
                 Ok(x) => x,
             };
 
-            let new_item_ids = item_ids(&new_feed);
+            let new_item_ids = new_feed
+                .items
+                .iter()
+                .map(|&(ref id, _)| id.clone())
+                .collect::<HashSet<_>>();
 
             let old_feed = self.feeds.get_mut(&feed_url).unwrap();
-            let old_item_ids = item_ids(&old_feed);
+            let old_item_ids = old_feed
+                .items
+                .iter()
+                .map(|&(ref id, _)| id.clone())
+                .collect::<HashSet<_>>();
+
+            let new_items_in_order = {
+                let strictly_new_item_ids = new_item_ids
+                    .difference(&old_item_ids)
+                    .collect::<HashSet<_>>();
+
+                let mut v = Vec::new();
+                for (id, item) in new_feed.items {
+                    if strictly_new_item_ids.contains(&id) {
+                        v.push((id, item));
+                    }
+                }
+                v
+            };
 
             if old_feed.title != new_feed.title && new_feed.title.is_some() {
                 old_feed.title = new_feed.title.clone();
             }
 
-            for item_id in new_item_ids.difference(&old_item_ids).collect::<Vec<_>>() {
-
-                let item = new_feed.items.remove(item_id).unwrap();
+            for (item_id, item) in new_items_in_order {
 
                 logger.log(
                     LogLevel::Verbose,
@@ -217,7 +233,7 @@ impl Database {
                 );
 
                 if !options.no_send {
-                    if let Err(e) = sender.send(&feed_url, &new_feed, &item_id, &item) {
+                    if let Err(e) = sender.send(&feed_url, &old_feed, &item_id, &item) {
                         logger.log(
                             LogLevel::Important,
                             LogKind::Error,
@@ -231,7 +247,7 @@ impl Database {
                     }
                 }
 
-                old_feed.items.insert(item_id.clone(), item);
+                old_feed.items.push((item_id, item));
             }
         }
 
@@ -242,7 +258,7 @@ impl Database {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Feed {
     title: Option<String>,
-    items: HashMap<String, FeedItem>, // id to item
+    items: Vec<(String, FeedItem)>, // id to item
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -260,7 +276,7 @@ impl Feed {
     fn new() -> Self {
         Feed {
             title: None,
-            items: HashMap::new(),
+            items: Vec::new(),
         }
     }
 }
@@ -698,7 +714,7 @@ mod tests {
                 (
                     String::from("golf"),
                     FeedItem {
-                        last_observed: got.items.get("golf").unwrap().last_observed,
+                        last_observed: got.items[0].1.last_observed,
                         title: Some(String::from("delta")),
                         link: Some(String::from("http://echo")),
                         content: Some(String::from("foxtrot")),
