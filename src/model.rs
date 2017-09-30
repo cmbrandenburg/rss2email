@@ -212,6 +212,7 @@ impl Database {
                         v.push((id, item));
                     }
                 }
+                v.reverse();
                 v
             };
 
@@ -355,12 +356,6 @@ impl Sender for EmailSender {
                     .with_cause(e)
                     .into_error()
             })?;
-
-        /*
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        writeln!(stdout.lock(), "Sending {:?}", email).unwrap();
-        */
 
         if !self.no_send {
             self.mail_client.lock().unwrap().send(email).map_err(|e| {
